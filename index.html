@@ -534,17 +534,35 @@ function parseMDL(wb, sheetName){
     rows.push({r:r, row:row, pkg:pkgVal});
   }
   // contiguous package blocks (by pkg column, ignoring fully-blank rows which don't break a run)
-  var blocks = [];
+  var blocksRaw = [];
   var cur = null;
   rows.forEach(function(item){
     var p = item.pkg;
     if(!p){ if(cur) cur.rows.push(item.r); return; } // blank package cell inside a block (continuation row)
     if(!cur || cur.pkg !== p){
       cur = {pkg:p, rows:[]};
-      blocks.push(cur);
+      blocksRaw.push(cur);
     }
     cur.rows.push(item.r);
   });
+
+  // Many trackers append a per-package roll-up table below the real document list, on the same
+  // sheet, whose own "package" column happens to land in the same column index as the main list's
+  // (e.g. a "Description / Building / Package / Total / Submitted / …" summary block). That table
+  // re-uses package names already seen above, so: drop generic non-package header/aggregate words,
+  // then keep only each package name's FIRST run and discard any later repeat — those later repeats
+  // are the roll-up section, not real document rows.
+  var NON_PACKAGE_WORDS = new Set(['package','description','total','summary','grand total','sno','s.no','s no']);
+  var seenPkg = new Set();
+  var blocks = [];
+  blocksRaw.forEach(function(b){
+    var key = b.pkg.trim().toLowerCase();
+    if(NON_PACKAGE_WORDS.has(key)) return;
+    if(seenPkg.has(key)) return; // later repeat = trailing roll-up section, not a real block
+    seenPkg.add(key);
+    blocks.push(b);
+  });
+
   return {
     sheetName:sheetName, aoa:aoa, headerIdx:headerIdx, headerRow:headerRow,
     colMap:cm.map, revPairs:cm.revPairs, blocks:blocks, lastRow: aoa.length-1
