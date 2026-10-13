@@ -381,6 +381,7 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx-populate/1.21.0/xlsx-populate-no-encryption.min.js"></script>
 <script>
 (function(){
 "use strict";
@@ -400,6 +401,14 @@ var S = {
 /* ============================== helpers ============================== */
 function norm(s){ return String(s==null?'':s).trim(); }
 function upperNorm(s){ return norm(s).toUpperCase(); }
+/* Submittal numbers are matched between the MDL tracker and the EIDA export as keys, and the two
+   sides sometimes carry different incidental whitespace for the same number (a stray tab or an
+   internal space typo'd into one side only, e.g. "SUB 1035" vs "SUB1035") — upperNorm's plain trim
+   leaves that whitespace in place and silently misses the match. Strip ALL whitespace, not just
+   leading/trailing, for every subNo comparison/lookup key (consistent with this tool's already-
+   validated Node-based reconciliation pipeline, which uses the same aggressive stripping). Never
+   use this for non-subNo text (titles, package names, etc.) — those need their real spacing. */
+function cleanSubNo(s){ return upperNorm(s).replace(/\s+/g,''); }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
 function colLetter(c){ var s=''; c++; while(c>0){ var m=(c-1)%26; s=String.fromCharCode(65+m)+s; c=Math.floor((c-m-1)/26); } return s; }
 
@@ -465,9 +474,19 @@ function classify(status, stage){
   var st = upperNorm(status), sg = upperNorm(stage);
   if(sg === 'CLOSED'){
     if(st === 'VOID') return 'excluded';
+    // A status that explicitly calls for resubmission overrides a leading "Approved" (e.g.
+    // "Approved with Comments. Resubmission Required") - checked before the bare-prefix test below.
+    if(st.indexOf('NO RESUBMISSION REQUIRED') !== -1) return 'approved';
+    if(st.indexOf('RESUBMISSION REQUIRED') !== -1) return 'resubmission';
+    if(st.indexOf('APPROVED') === 0) return 'approved';
+    if(st.indexOf('NOT APPROVED') === 0) return 'resubmission';
+    // Ambiguous closed-stage text ("Not Reviewed. Received as Information", "Reviewed . No
+    // comments", blank, …) - per user decision: treat Closed + no rejection language as Approved.
     return 'approved';
   }
   if(sg === 'INITIATOR'){
+    if(st.indexOf('NO RESUBMISSION REQUIRED') !== -1) return 'approved';
+    if(st.indexOf('RESUBMISSION REQUIRED') !== -1) return 'resubmission';
     return st.indexOf('APPROVED') === 0 ? 'approved' : 'resubmission';
   }
   if(sg === 'DESIGN CONSULTANT AND CLIENT TEAM') return 'jacobsReview';
@@ -643,8 +662,225 @@ function parseMDL(wb, sheetName){
 
   return {
     sheetName:sheetName, aoa:aoa, headerIdx:headerIdx, headerRow:headerRow,
-    colMap:cm.map, revPairs:cm.revPairs, blocks:blocks, lastRow: aoa.length-1
+    colMap:cm.map, revPairs:cm.revPairs, blocks:blocks, lastRow: aoa.length-1,
+    allHeaderRows: findAllHeaderRows(aoa)
   };
+}
+
+/* Every row in the sheet that looks like a main-list header, not just the first one (findHeaderRow
+   only scans the first 12 rows). Some trackers repeat the header partway down the sheet (e.g. when
+   a second group of packages starts a fresh block) - this is used only to find the boundary between
+   such sections, for scoping an un-labelled roll-up summary block (see associateRollupBlocks). */
+function findAllHeaderRows(aoa){
+  var out = [];
+  for(var i=0;i<aoa.length;i++){
+    if(scoreHeaderRow(aoa[i]||[]) >= 2) out.push(i);
+  }
+  return out;
+}
+
+/* ============================== roll-up summary table refresh ==============================
+   Many trackers carry a second, per-package summary table below (or interleaved with) the real
+   document list: 5 category rows (Data Sheet / GA Drawing / Layout / QA-QC / Others) plus a Total
+   row, with Total/Submitted/Balance as live COUNTIF formulas but the Resubmission/Under-Review-L&T/
+   Under-Review-Jacob/Under-Review-TSMPL/Approved columns as plain numbers that go stale the moment
+   new EIDA activity comes in. This block recomputes those five columns as a fresh current-state
+   snapshot from the same classify() logic used for the dashboard, and nothing else (the formula
+   columns are left completely untouched). Three layouts are handled, auto-detected per block:
+     - "cupmdl": a single header row ("Description | Building | Package | Total | Submitted | …")
+       with the package name repeated inline on every category row - matched to a main-list package
+       by exact name.
+     - "wwt": a two-row header ("Description | Total | Submission Status | … / | | Submitted |
+       Balance | …") with a package-name LABEL row a few rows above each block - matched to a
+       main-list package positionally (in document order), since the label text often doesn't match
+       the main list's package name exactly (e.g. "electrical" vs "WWT-ELECTRICAL").
+     - no label and no inline package name at all: the block is an AGGREGATE covering every package
+       in the section of the sheet it concludes (bounded by the nearest earlier header row) - e.g.
+       UG & Trestle Piping's sheet, which restarts its main list with a fresh header partway down. */
+function normKeyRU(s){ return upperNorm(s).replace(/[^A-Z0-9]/g,''); }
+
+function rollupCategoryOf(s){
+  var t = norm(s).toLowerCase();
+  if(/^data\s*sheet$/.test(t)) return 'Data Sheet';
+  if(/^ga\s*drawing$/.test(t)) return 'GA Drawing';
+  if(/^layout$/.test(t)) return 'Layout';
+  if(/^qa\s*\/?\s*qc$/.test(t)) return 'QA/QC';
+  if(/^others?$/.test(t)) return 'Others';
+  return null;
+}
+
+function detectRollupTrigger(aoa, i){
+  var row0 = aoa[i] || [];
+  var col0 = norm(row0[0]).toLowerCase();
+  var col1 = norm(row0[1]).toLowerCase();
+  if(col0 === 'description' && col1 === 'building'){
+    return {style:'cupmdl', cols:{building:1, pkg:2, total:3, submitted:4, balance:5, resub:6, lt:7, jacob:8, tsmpl:9, approved:10}, catStartRow:i+1};
+  }
+  if(col1 === 'total'){
+    var col2 = norm(row0[2]).toLowerCase();
+    var cols = {total:1, submitted:2, balance:3, resub:4, lt:5, jacob:6, tsmpl:7, approved:8};
+    if(col2 === 'submitted') return {style:'wwt', cols:cols, catStartRow:i+1};
+    return {style:'wwt', cols:cols, catStartRow:i+2};
+  }
+  return null;
+}
+
+function findRUPackageLabel(aoa, i){
+  for(var back=1; back<=5; back++){
+    var lr = i-back;
+    if(lr<0) break;
+    var lrow = aoa[lr] || [];
+    var a = norm(lrow[0]);
+    var restEmpty = lrow.slice(1,12).every(function(v){ return norm(v)===''; });
+    var aLower = a.toLowerCase();
+    var isStructural = !a || aLower==='description' || aLower==='total' || restEmpty;
+    if(!isStructural) break; // a real main-list data row: stop, no label found
+    if(a && restEmpty && aLower!=='description' && aLower!=='total' && !rollupCategoryOf(a)) return a;
+  }
+  return null;
+}
+
+function parseRUCycle(aoa, catStartRow, cols){
+  var r = catStartRow, guard = 0, pkgInline = null, catRows = {};
+  var blankSkip = 0;
+  while(blankSkip<3 && r<aoa.length && (aoa[r]||[]).every(function(v){ return norm(v)===''; })){ r++; blankSkip++; }
+  while(guard<6){
+    var row = aoa[r] || [];
+    var cat = rollupCategoryOf(row[0]);
+    if(cat && !catRows[cat]){
+      catRows[cat] = r;
+      if(cols.pkg!==undefined && pkgInline===null){
+        var p = norm(row[cols.pkg]); if(p) pkgInline = p;
+      }
+      r++; guard++; continue;
+    }
+    break;
+  }
+  if(Object.keys(catRows).length===0) return null;
+  var totalRow = (norm((aoa[r]||[])[0]).toLowerCase()==='total') ? r : null;
+  return {catRows:catRows, totalRow:totalRow, pkgInline:pkgInline, nextRow: totalRow!==null?totalRow+1:r};
+}
+
+function parseRollupRegion(aoa, i){
+  var trig0 = detectRollupTrigger(aoa, i);
+  if(!trig0) return null;
+  var blocks = [], triggerRow = i, trig = trig0;
+  var label = trig.style==='wwt' ? findRUPackageLabel(aoa, triggerRow) : null;
+  var lastRow = i;
+  while(trig){
+    var cyc = parseRUCycle(aoa, trig.catStartRow, trig.cols);
+    if(!cyc) break;
+    blocks.push({style:trig.style, cols:trig.cols, headerRow:triggerRow, catRows:cyc.catRows, totalRow:cyc.totalRow, label:label, pkgInline:cyc.pkgInline});
+    lastRow = cyc.totalRow!==null ? cyc.totalRow : (trig.catStartRow + Object.keys(cyc.catRows).length - 1);
+    if(trig.style==='cupmdl'){
+      var nextStart = cyc.nextRow;
+      var nextCyc = parseRUCycle(aoa, nextStart, trig.cols);
+      if(!nextCyc) break;
+      trig = {style:'cupmdl', cols:trig.cols, catStartRow:nextStart};
+      label = null;
+      continue;
+    }
+    var scanFrom = cyc.nextRow, foundTriggerRow = -1, foundLabel = null;
+    for(var k=0;k<6;k++){
+      var rr = scanFrom+k;
+      if(rr>=aoa.length) break;
+      var t = detectRollupTrigger(aoa, rr);
+      if(t){ foundTriggerRow = rr; break; }
+      var rowk = aoa[rr]||[];
+      var a = norm(rowk[0]);
+      var restEmpty = rowk.slice(1,12).every(function(v){ return norm(v)===''; });
+      if(a && restEmpty && !rollupCategoryOf(a) && a.toLowerCase()!=='total') foundLabel = a;
+      else if(a && !restEmpty) break;
+    }
+    if(foundTriggerRow===-1){ trig = null; break; }
+    triggerRow = foundTriggerRow;
+    trig = detectRollupTrigger(aoa, triggerRow);
+    label = foundLabel;
+  }
+  return {blocks:blocks, endRow:lastRow};
+}
+
+function findRollupBlocks(aoa, dataStartRow){
+  var out = [], r = dataStartRow;
+  while(r<aoa.length){
+    var region = parseRollupRegion(aoa, r);
+    if(region && region.blocks.length){
+      region.blocks.forEach(function(b){ out.push(b); });
+      r = region.endRow+1;
+    } else {
+      r++;
+    }
+  }
+  return out;
+}
+
+/* Match each detected roll-up block to the main-list package block(s) it summarizes, and attach
+   the matching rows as b.scopeRows. Returns an array of human-readable warnings. */
+function associateRollupBlocks(mdl){
+  var rbs = findRollupBlocks(mdl.aoa, mdl.headerIdx+1);
+  var warnings = [];
+  var blocksByKey = {};
+  mdl.blocks.forEach(function(b){ blocksByKey[normKeyRU(b.pkg)] = b; });
+
+  rbs.forEach(function(b){
+    if(b.pkgInline){
+      var key = normKeyRU(b.pkgInline);
+      b.scopeRows = (blocksByKey[key] ? blocksByKey[key].rows : []);
+      if(!b.scopeRows.length) warnings.push('Roll-up block for package "'+b.pkgInline+'" ('+mdl.sheetName+') did not match any package in the main list - left untouched.');
+    }
+  });
+
+  var labelBlocks = rbs.filter(function(b){ return b.label && !b.pkgInline; });
+  if(labelBlocks.length){
+    if(labelBlocks.length === mdl.blocks.length){
+      labelBlocks.forEach(function(b, idx){
+        var pkgBlock = mdl.blocks[idx];
+        b.matchedPackage = pkgBlock.pkg;
+        b.scopeRows = pkgBlock.rows;
+      });
+    } else {
+      warnings.push('On "'+mdl.sheetName+'": found '+labelBlocks.length+' labelled summary block(s) but '+mdl.blocks.length+' package(s) - counts did not line up 1:1, so the summary table was left untouched on this sheet.');
+      labelBlocks.forEach(function(b){ b.scopeRows = []; });
+    }
+  }
+
+  rbs.filter(function(b){ return !b.label && !b.pkgInline; }).forEach(function(b){
+    var sectionStart = -1;
+    mdl.allHeaderRows.forEach(function(hr){ if(hr < b.headerRow && hr > sectionStart) sectionStart = hr; });
+    var rows = [];
+    mdl.blocks.forEach(function(pb){ pb.rows.forEach(function(r){ if(r>sectionStart && r<b.headerRow) rows.push(r); }); });
+    b.scopeRows = rows;
+  });
+
+  mdl.rollupBlocks = rbs;
+  return warnings;
+}
+
+/* Fresh bucket tallies for one roll-up block's scope, from the SAME classify() logic as the
+   dashboard - matchedCount lets the caller skip writing when this EIDA export has zero coverage
+   of these rows (so a narrowly-scoped export never zeroes out a package's real counts). */
+function computeRollupTallies(mdl, eida, scopeRows){
+  var cm = mdl.colMap;
+  var out = {};
+  CATEGORY_ORDER.forEach(function(c){ out[c] = {resub:0, lt:0, jacob:0, tsmpl:0, approved:0}; });
+  var matchedCount = 0;
+  var BUCKET_TO_KEY = {approved:'approved', ltReview:'lt', jacobsReview:'jacob', tsmplReview:'tsmpl', resubmission:'resub'};
+  scopeRows.forEach(function(r){
+    var subNo = norm(rowVal(mdl, r, cm.subNo));
+    if(!subNo) return;
+    var e = eida.index.get(cleanSubNo(subNo));
+    if(!e) return;
+    matchedCount++;
+    var bucket = classify(e.status, e.stage);
+    var key = BUCKET_TO_KEY[bucket];
+    if(!key) return; // excluded (VOID) or unknown - leave uncounted
+    var title = rowVal(mdl, r, cm.title);
+    var catText = cm.subCat!==undefined ? rowVal(mdl, r, cm.subCat) : '';
+    var category = normalizeCategory(catText, title);
+    if(!out[category]) return;
+    out[category][key]++;
+  });
+  return {tallies:out, matchedCount:matchedCount};
 }
 
 var EIDA_FIELD_PATTERNS = {
@@ -708,7 +944,7 @@ function parseEIDA(wb, sheetName){
     });
   }
   var index = new Map();
-  rows.forEach(function(row){ index.set(upperNorm(row.subNo), row); });
+  rows.forEach(function(row){ index.set(cleanSubNo(row.subNo), row); });
   return {sheetName:sheetName, headerIdx:headerIdx, colMap:map, rows:rows, index:index};
 }
 
@@ -723,7 +959,7 @@ function analyzeBlock(mdl, eida, block){
   var rowsInfo = block.rows.map(function(r){
     return { r:r, subNo: norm(rowVal(mdl,r,cm.subNo)), title: norm(rowVal(mdl,r,cm.title)) };
   });
-  var existingSubs = rowsInfo.filter(function(x){return x.subNo;}).map(function(x){return upperNorm(x.subNo);});
+  var existingSubs = rowsInfo.filter(function(x){return x.subNo;}).map(function(x){return cleanSubNo(x.subNo);});
   var existingSet = new Set(existingSubs);
 
   // identity discovery: tally (originator,pkg) among matched eida rows
@@ -769,7 +1005,7 @@ function analyzeBlock(mdl, eida, block){
 
   // 1) UPDATE ops: rows already carrying a tracked subno
   rowsInfo.filter(function(x){return x.subNo;}).forEach(function(x){
-    var e = eida.index.get(upperNorm(x.subNo));
+    var e = eida.index.get(cleanSubNo(x.subNo));
     if(!e) return; // subno on file but not present in this export at all - leave untouched
     var bucket = classify(e.status, e.stage);
     if(bucket === 'unknown'){
@@ -785,7 +1021,7 @@ function analyzeBlock(mdl, eida, block){
 
   // candidate eida rows belonging to this identity but not yet tracked anywhere in the block
   var candidates = eida.rows.filter(function(e){
-    return identitySet.has(e.originator+'\u0001'+e.pkg) && !existingSet.has(upperNorm(e.subNo));
+    return identitySet.has(e.originator+'\u0001'+e.pkg) && !existingSet.has(cleanSubNo(e.subNo));
   });
   var blankRows = rowsInfo.filter(function(x){ return !x.subNo; });
 
@@ -818,7 +1054,7 @@ function analyzeBlock(mdl, eida, block){
       if(score>bestScore2){ bestScore2=score; best2=b; }
     });
     if(best2 && bestScore2 >= FUZZY_THRESHOLD){
-      var oldStillLive = eida.index.has(upperNorm(best2.subNo));
+      var oldStillLive = eida.index.has(cleanSubNo(best2.subNo));
       result.ops.push({
         type:'super', row:best2.r, oldSubNo:best2.subNo, subNo:e.subNo, eida:e, bucket:bucket,
         title:best2.title, score:bestScore2, oldStillLive:oldStillLive,
@@ -836,9 +1072,30 @@ function analyzeBlock(mdl, eida, block){
   return result;
 }
 
+/* computeRollupTallies recomputes a block's 5 bucket columns completely from scratch, counting
+   ONLY the rows that matched this EIDA export — any scope row that didn't match simply isn't
+   represented in the fresh numbers. That's safe when the export covers most of the block (the real
+   CUP MDL packages seen so far: 65-98% matched), but if only a handful of a much larger package's
+   documents happen to appear in a narrow export, "recomputed from scratch" would wipe out every
+   other document's real status (observed directly: a WWT package with 1 of 39 docs matched would
+   otherwise collapse "18 approved" down to "1"). Require BOTH a minimum sample and a minimum
+   coverage ratio before trusting a full recompute; below that, the block is left untouched exactly
+   like the zero-match case already was. */
+var ROLLUP_MIN_MATCH = 5, ROLLUP_MIN_COVERAGE = 0.5;
+function rollupCoverageOk(matchedCount, scopeCount){
+  return scopeCount>0 && matchedCount>=ROLLUP_MIN_MATCH && (matchedCount/scopeCount)>=ROLLUP_MIN_COVERAGE;
+}
+
 function runAnalysis(){
   S.mdlSheets.forEach(function(entry){
     entry.blocks = entry.mdl.blocks.map(function(b){ return analyzeBlock(entry.mdl, S.eida, b); });
+    entry.rollupWarnings = associateRollupBlocks(entry.mdl);
+    (entry.mdl.rollupBlocks||[]).forEach(function(b){
+      var r = computeRollupTallies(entry.mdl, S.eida, b.scopeRows||[]);
+      b.freshTallies = r.tallies;
+      b.matchedCount = r.matchedCount;
+      b.writeOk = rollupCoverageOk(r.matchedCount, (b.scopeRows||[]).length);
+    });
   });
 }
 
@@ -1025,14 +1282,60 @@ function opDescribe(op){
         sub: (op.oldStillLive ? 'Old '+op.oldSubNo+' is still live elsewhere in EIDA — verify before replacing. ' : 'Old '+op.oldSubNo+' is fully retired from EIDA — safe to replace. ')+
              'New: '+op.subNo+' ("'+esc(op.eida.subject)+'") · match '+(Math.round(op.score*100))+'% · → '+BUCKET_LABEL[op.bucket]};
     case 'new':
-      return {tag:'new', tagLabel:'New row', text: esc(op.eida.subject||'(no subject)'),
-        sub: op.eida.subNo+' · category guess: '+op.category+' · → '+BUCKET_LABEL[op.bucket]};
+      return {tag:'new', tagLabel:'New row (preview only)', text: esc(op.eida.subject||'(no subject)'),
+        sub: op.eida.subNo+' · category guess: '+op.category+' · → '+BUCKET_LABEL[op.bucket]+
+             ' · shown in the dashboard preview below, but NOT added as a row to the downloaded file — insert it manually in your tracker, then re-run next time to pick up its status.'};
     case 'void':
       return {tag:'void', tagLabel:'Excluded', text: esc(op.eida.subject||op.eida.subNo),
         sub: op.eida.subNo+' is VOID in EIDA — not added.'};
   }
 }
 function opId(si, bi, oi){ return 'op-'+si+'-'+bi+'-'+oi; }
+
+var RU_FIELD_COLS = ['resub','lt','jacob','tsmpl','approved'];
+/* How many of the 5 bucket cells across a roll-up block's category rows would actually change
+   if written. b.writeOk false means this export's coverage of the block is zero or too thin to
+   trust a full recompute (see rollupCoverageOk) - the block is left untouched on download (see
+   buildOutputWorkbook), so it's reported as 0. */
+function rollupBlockChangeCount(mdl, b){
+  if(!b.freshTallies || !b.writeOk) return 0;
+  var n = 0;
+  CATEGORY_ORDER.forEach(function(cat){
+    var r = b.catRows[cat];
+    if(r===undefined) return;
+    var row = mdl.aoa[r] || [];
+    var fresh = b.freshTallies[cat];
+    RU_FIELD_COLS.forEach(function(key){
+      var col = b.cols[key];
+      if(col===undefined) return;
+      var cur = Number(row[col]) || 0;
+      if(cur !== fresh[key]) n++;
+    });
+  });
+  return n;
+}
+function rollupSummaryHtml(entry){
+  var blocks = entry.mdl.rollupBlocks || [];
+  if(!blocks.length) return '';
+  var totalChanged = 0, totalSkipped = 0;
+  var rows = blocks.map(function(b){
+    var label = b.pkgInline || b.matchedPackage || b.label || '(unlabelled block)';
+    var changed = rollupBlockChangeCount(entry.mdl, b);
+    totalChanged += changed;
+    if(!b.writeOk) totalSkipped++;
+    return {label:label, changed:changed, matched:b.matchedCount||0, scope:(b.scopeRows||[]).length, writeOk:b.writeOk};
+  });
+  var lines = rows.map(function(r){
+    var reason = r.matched===0 ? 'no coverage in this export' : ('only '+r.matched+'/'+r.scope+' docs matched — too thin to trust a full refresh');
+    return esc(r.label)+': '+r.scope+' docs in scope, '+r.matched+' matched to this EIDA export, '+
+      (r.writeOk ? r.changed+' bucket cell'+(r.changed===1?'':'s')+' will be refreshed' : reason+' — left as-is');
+  }).join('<br>');
+  return '<div class="hint" style="padding:8px 0 14px">'+
+    '<b>Roll-up summary table'+(blocks.length>1?'s':'')+' on this sheet</b> — '+blocks.length+' block'+(blocks.length===1?'':'s')+
+    ' detected, '+totalChanged+' cell'+(totalChanged===1?'':'s')+' will be refreshed on download'+
+    (totalSkipped ? ' ('+totalSkipped+' block'+(totalSkipped===1?'':'s')+' has too little EIDA coverage this time and is left untouched)' : '')+
+    '.<br>'+lines+'</div>';
+}
 
 function renderReview(){
   var totalOps=0, needsReview=0, autoApply=0, totalBlocks=0;
@@ -1059,6 +1362,7 @@ function renderReview(){
   var globalWarnings = [];
   S.mdlSheets.forEach(function(entry){
     entry.blocks.forEach(function(b){ b.warnings.forEach(function(w){ globalWarnings.push(entry.sheetName+' / '+b.pkg+': '+w); }); });
+    (entry.rollupWarnings||[]).forEach(function(w){ globalWarnings.push(w); });
   });
   document.getElementById('warnings-wrap').innerHTML = globalWarnings.length ?
     '<div class="warnbox"><b>Notes</b><br>'+globalWarnings.map(esc).join('<br>')+'</div>' : '';
@@ -1066,6 +1370,7 @@ function renderReview(){
   var html = '';
   S.mdlSheets.forEach(function(entry, si){
     html += '<div class="sheetheading"><b>'+esc(entry.sheetName)+'</b></div>';
+    html += rollupSummaryHtml(entry);
     entry.blocks.forEach(function(b, bi){
       var visOps = b.ops.filter(function(op){return op.type!=='void';});
       var confBadge = b.matchedCount===0 ? '<span class="badge none">no identity</span>' :
@@ -1393,184 +1698,93 @@ document.querySelectorAll('#pkg-table th').forEach(function(th){
   });
 });
 
-/* ============================== workbook writer ============================== */
-function setCell(ws, r, c, value, type, fmt){
-  if(c===undefined || c===null) return;
-  var addr = XLSX.utils.encode_cell({r:r, c:c});
+/* ============================== workbook writer (xlsx-populate — preserves ALL formatting) ==============================
+   Writes go through xlsx-populate, loading S.mdlFile directly, instead of SheetJS's XLSX.write
+   (whose free build drops styles on round-trip — this was the tool's original complaint). Only
+   value-level writes happen: existing cells' values/dates/strings, never styles, so every fill
+   color, border, font and merge in the original file survives untouched.
+
+   Brand-new documents ('new' ops) are intentionally NOT written here — they stay preview-only in
+   the review list and dashboard above. Inserting a real row safely means shifting every formula
+   reference, merged range and conditional-format range below it, which is exactly the kind of risk
+   this tool should not take unattended; the user adds the row by hand in their tracker and the next
+   reconciliation run will then pick up its status normally. */
+function setCellXP(sheet, r0, c0, value){
+  if(c0===undefined || c0===null) return;
   if(value===null || value===undefined || value===''){ return; }
-  var cell = {t:type||'s', v:value};
-  if(fmt) cell.z = fmt;
-  ws[addr] = cell;
-  var range = XLSX.utils.decode_range(ws['!ref']);
-  var changed = false;
-  if(r>range.e.r){ range.e.r=r; changed=true; }
-  if(c>range.e.c){ range.e.c=c; changed=true; }
-  if(r<range.s.r){ range.s.r=r; changed=true; }
-  if(c<range.s.c){ range.s.c=c; changed=true; }
-  if(changed) ws['!ref'] = XLSX.utils.encode_range(range);
+  sheet.cell(r0+1, c0+1).value(value); // xlsx-populate is 1-indexed; our row/col indices are 0-indexed
 }
 
-/* Shift every formula in the workbook that references sheet wsName's rows >= atRow, by +count.
-   A range END that lands exactly on the row immediately above the insertion point (atRow-1) is
-   treated as the boundary of the block being appended to, and is extended by +count as well —
-   this matches how these block-scoped COUNTIF/COUNTIFS ranges need to grow when new rows are
-   appended at the end of a package's block (Excel does not reliably auto-grow this on its own). */
-var CELLREF_RE = /((?:'[^']+'|[A-Za-z_][A-Za-z0-9_.]*)!)?(\$?[A-Z]{1,3}\$?)(\d+)/g;
-function shiftFormulaRefs(wb, wsName, atRow, count){
-  Object.keys(wb.Sheets).forEach(function(sn){
-    var ws = wb.Sheets[sn];
-    Object.keys(ws).forEach(function(addr){
-      if(addr[0]==='!') return;
-      var cell = ws[addr];
-      if(!cell || typeof cell.f !== 'string') return;
-      var isSelfSheet = (sn === wsName);
-      var lastSheet = null; // tracks the sheet context carried by a range's first endpoint, for its un-prefixed second endpoint
-      var newF = cell.f.replace(CELLREF_RE, function(m, prefix, colPart, rowPart, offset, str){
-        var isRangeEnd = str[offset-1] === ':';
-        var refSheet;
-        if(prefix){
-          refSheet = prefix.slice(0,-1).replace(/^'|'$/g,'');
-        } else if(isRangeEnd){
-          refSheet = lastSheet; // second half of an A1:B2-style range shares the first half's sheet
-        } else {
-          refSheet = null; // independent bare reference = current sheet
-        }
-        lastSheet = refSheet; // becomes the context for a following ":"-continuation, if any
-        var appliesHere = (refSheet===null) ? isSelfSheet : (refSheet === wsName);
-        if(!appliesHere) return m;
-        var rowNum = parseInt(rowPart,10); // 1-based in formula text
-        var rowNum0 = rowNum-1; // 0-based
-        if(rowNum0 >= atRow || (isRangeEnd && rowNum0 === atRow-1)){
-          return (prefix||'') + colPart + (rowNum+count);
-        }
-        return m;
+function writeRowUpdateXP(sheet, cm, revPairs, op){
+  var r = op.row;
+  if(op.type==='fill' || op.type==='super'){
+    setCellXP(sheet, r, cm.subNo, op.subNo);
+  }
+  var revIdx = parseInt(op.eida.revNo,10);
+  if(!isNaN(revIdx) && revPairs[revIdx]){
+    var pair = revPairs[revIdx];
+    if(op.eida.genDate) setCellXP(sheet, r, pair.genCol, op.eida.genDate);
+    if(op.eida.returned) setCellXP(sheet, r, pair.retCol, op.eida.returned);
+  }
+  if(cm.approvalTxt!==undefined){
+    setCellXP(sheet, r, cm.approvalTxt, BUCKET_LABEL[op.bucket]);
+  }
+}
+
+/* Refresh a sheet's roll-up summary-table bucket cells (Resubmission / Under-Review-x / Approved) from
+   each block's freshly computed tallies (see computeRollupTallies, run in runAnalysis). A block
+   whose coverage fails rollupCoverageOk — this EIDA export has zero, or too thin, coverage of its
+   scope — is left completely untouched, so a narrowly-scoped export (see the project-wide CUP-only
+   limitation already found in this tool's chat-based runs) never falsely zeroes out a package's
+   real counts. Total/Submitted/Balance are COUNTIF formulas and are never written here — only the
+   5 plain-number columns are a point-in-time snapshot. */
+function writeRollupTalliesXP(sheet, mdl){
+  (mdl.rollupBlocks||[]).forEach(function(b){
+    if(!b.writeOk || !b.freshTallies) return;
+    CATEGORY_ORDER.forEach(function(cat){
+      var r = b.catRows[cat];
+      if(r===undefined) return;
+      var fresh = b.freshTallies[cat];
+      RU_FIELD_COLS.forEach(function(key){
+        var col = b.cols[key];
+        if(col===undefined) return;
+        sheet.cell(r+1, col+1).value(fresh[key]);
       });
-      /* Leave the (now stale) cached value in place rather than deleting it — clearing .v while
-         keeping a numeric .t produced a malformed cell that some writers drop entirely on
-         round-trip. We force a full recalculation on load instead (see buildOutputWorkbook), so
-         Excel recomputes every formula, including these, the moment the file is opened. */
-      if(newF !== cell.f){ cell.f = newF; }
     });
   });
 }
 
-function insertRowsAt(wb, wsName, atRow, count, block){
-  if(count<=0) return;
-  var ws = wb.Sheets[wsName];
-  var range = XLSX.utils.decode_range(ws['!ref']);
-  for(var R=range.e.r; R>=atRow; R--){
-    for(var C=range.s.c; C<=range.e.c; C++){
-      var oldAddr = XLSX.utils.encode_cell({r:R,c:C});
-      if(ws[oldAddr]){
-        var newAddr = XLSX.utils.encode_cell({r:R+count,c:C});
-        ws[newAddr] = ws[oldAddr];
-        delete ws[oldAddr];
-      }
-    }
-  }
-  range.e.r += count;
-  ws['!ref'] = XLSX.utils.encode_range(range);
-  if(ws['!merges']){
-    ws['!merges'].forEach(function(m){
-      if(m.s.r>=atRow) m.s.r+=count;
-      if(m.e.r>=atRow) m.e.r+=count;
-    });
-  }
-  // best-effort: carry the style of the row directly above into the newly-opened rows, when styles were parsed
-  for(var i=0;i<count;i++){
-    var targetRow = atRow+i;
-    for(var C2=range.s.c; C2<=range.e.c; C2++){
-      var srcAddr = XLSX.utils.encode_cell({r:atRow-1,c:C2});
-      var src = ws[srcAddr];
-      if(src && src.s){
-        var tgtAddr = XLSX.utils.encode_cell({r:targetRow,c:C2});
-        if(!ws[tgtAddr]) ws[tgtAddr] = {t:'s', v:''};
-        ws[tgtAddr].s = src.s;
-      }
-    }
-  }
-  shiftFormulaRefs(wb, wsName, atRow, count);
-}
-
-function writeRowUpdate(ws, cm, revPairs, op){
-  var r = op.row;
-  if(op.type==='fill' || op.type==='super'){
-    setCell(ws, r, cm.subNo, op.subNo, 's');
-  }
-  var revIdx = parseInt(op.eida.revNo,10);
-  if(!isNaN(revIdx) && revPairs[revIdx]){
-    var pair = revPairs[revIdx];
-    if(op.eida.genDate) setCell(ws, r, pair.genCol, op.eida.genDate, 'd', 'dd-mmm-yy');
-    if(op.eida.returned) setCell(ws, r, pair.retCol, op.eida.returned, 'd', 'dd-mmm-yy');
-  }
-  if(cm.approvalTxt!==undefined){
-    setCell(ws, r, cm.approvalTxt, BUCKET_LABEL[op.bucket], 's');
-  }
-}
-function writeNewRow(ws, r, cm, revPairs, block, op){
-  if(cm.pkg!==undefined) setCell(ws, r, cm.pkg, block.pkg, 's');
-  if(cm.subCat!==undefined) setCell(ws, r, cm.subCat, op.category, 's');
-  if(cm.title!==undefined) setCell(ws, r, cm.title, op.eida.subject, 's');
-  setCell(ws, r, cm.subNo, op.eida.subNo, 's');
-  var revIdx = parseInt(op.eida.revNo,10);
-  if(!isNaN(revIdx) && revPairs[revIdx]){
-    var pair = revPairs[revIdx];
-    if(op.eida.genDate) setCell(ws, r, pair.genCol, op.eida.genDate, 'd', 'dd-mmm-yy');
-    if(op.eida.returned) setCell(ws, r, pair.retCol, op.eida.returned, 'd', 'dd-mmm-yy');
-  }
-  if(cm.approvalTxt!==undefined) setCell(ws, r, cm.approvalTxt, BUCKET_LABEL[op.bucket], 's');
-}
-
 function buildOutputWorkbook(){
-  return S.mdlFile.arrayBuffer().then(function(buf){
-    var wbOut = XLSX.read(buf, {type:'array', cellDates:true, cellStyles:true, cellNF:true});
-
-    // group applied ops by sheet, then by package within that sheet
+  return XlsxPopulate.fromDataAsync(S.mdlFile).then(function(wbOut){
     var opsBySheet = {};
     S.appliedOps.forEach(function(c){
-      if(!opsBySheet[c.sheetName]) opsBySheet[c.sheetName] = {};
-      var byPkg = opsBySheet[c.sheetName];
-      if(!byPkg[c.pkg]) byPkg[c.pkg] = {cell:[], news:[]};
-      if(c.op.type==='new') byPkg[c.pkg].news.push(c.op);
-      else byPkg[c.pkg].cell.push(c.op);
+      if(c.op.type==='new') return; // preview-only — see comment above
+      (opsBySheet[c.sheetName] = opsBySheet[c.sheetName] || []).push(c.op);
     });
 
     S.mdlSheets.forEach(function(entry){
       var wsName = entry.sheetName;
-      var ws = wbOut.Sheets[wsName];
+      var sheet = wbOut.sheet(wsName);
+      if(!sheet) return;
       var cm = entry.mdl.colMap;
       var revPairs = entry.mdl.revPairs;
-      var opsByBlock = opsBySheet[wsName];
-      if(!opsByBlock) return;
-
-      Object.keys(opsByBlock).forEach(function(pkg){
-        opsByBlock[pkg].cell.forEach(function(op){ writeRowUpdate(ws, cm, revPairs, op); });
-      });
-
-      var blocksWithNew = entry.mdl.blocks.filter(function(b){ return opsByBlock[b.pkg] && opsByBlock[b.pkg].news.length; });
-      blocksWithNew.sort(function(a,b){ return Math.max.apply(null,b.rows) - Math.max.apply(null,a.rows); });
-      blocksWithNew.forEach(function(b){
-        var news = opsByBlock[b.pkg].news;
-        var insertAt = Math.max.apply(null, b.rows) + 1;
-        insertRowsAt(wbOut, wsName, insertAt, news.length, b);
-        news.forEach(function(op, i){ writeNewRow(ws, insertAt+i, cm, revPairs, b, op); });
-      });
+      (opsBySheet[wsName]||[]).forEach(function(op){ writeRowUpdateXP(sheet, cm, revPairs, op); });
+      writeRollupTalliesXP(sheet, entry.mdl);
     });
 
-    // force Excel to recompute every formula on open, since shifted/updated formulas may carry stale cached values
-    wbOut.Workbook = wbOut.Workbook || {};
-    wbOut.Workbook.CalcPr = Object.assign({}, wbOut.Workbook.CalcPr, {fullCalcOnLoad: true});
+    // force Excel/LibreOffice to recompute every formula on open, since Total/Submitted/Balance
+    // and other formulas must reflect the freshly-written values
+    var calcPr = (wbOut._node.children || []).find(function(c){ return c.name === 'calcPr'; });
+    if(calcPr){ calcPr.attributes.fullCalcOnLoad = 1; calcPr.attributes.calcOnSave = 1; }
 
-    return wbOut;
+    return wbOut.outputAsync(); // resolves a Blob in-browser
   });
 }
 
 document.getElementById('btn-download').addEventListener('click', function(){
   var statusEl = document.getElementById('download-status');
-  statusEl.textContent = 'Building workbook…';
-  buildOutputWorkbook().then(function(wbOut){
-    var out = XLSX.write(wbOut, {type:'array', bookType:'xlsx'});
-    var blob = new Blob([out], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+  statusEl.textContent = 'Building workbook (preserving your original formatting)…';
+  buildOutputWorkbook().then(function(blob){
     var filename = (S.mdlFile.name||'MDL').replace(/\.xlsx?$/i,'') + ' - Updated.xlsx';
     return saveFile(filename, blob);
   }).then(function(){
